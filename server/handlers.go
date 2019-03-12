@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	jose "gopkg.in/square/go-jose.v2"
+	"gopkg.in/square/go-jose.v2"
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/server/internal"
@@ -147,16 +149,17 @@ func (s *Server) handlePublicKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 type discovery struct {
-	Issuer        string   `json:"issuer"`
-	Auth          string   `json:"authorization_endpoint"`
-	Token         string   `json:"token_endpoint"`
-	Keys          string   `json:"jwks_uri"`
-	ResponseTypes []string `json:"response_types_supported"`
-	Subjects      []string `json:"subject_types_supported"`
-	IDTokenAlgs   []string `json:"id_token_signing_alg_values_supported"`
-	Scopes        []string `json:"scopes_supported"`
-	AuthMethods   []string `json:"token_endpoint_auth_methods_supported"`
-	Claims        []string `json:"claims_supported"`
+	Issuer               string   `json:"issuer"`
+	Auth                 string   `json:"authorization_endpoint"`
+	Token                string   `json:"token_endpoint"`
+	Keys                 string   `json:"jwks_uri"`
+	ResponseTypes        []string `json:"response_types_supported"`
+	Subjects             []string `json:"subject_types_supported"`
+	IDTokenAlgs          []string `json:"id_token_signing_alg_values_supported"`
+	Scopes               []string `json:"scopes_supported"`
+	AuthMethods          []string `json:"token_endpoint_auth_methods_supported"`
+	Claims               []string `json:"claims_supported"`
+	CodeChallengeMethods []string `json:"code_challenge_methods_supported"`
 }
 
 func (s *Server) discoveryHandler() (http.HandlerFunc, error) {
@@ -173,6 +176,7 @@ func (s *Server) discoveryHandler() (http.HandlerFunc, error) {
 			"aud", "email", "email_verified", "exp",
 			"iat", "iss", "locale", "name", "sub",
 		},
+		CodeChallengeMethods: []string{"plain", "S256"},
 	}
 
 	for responseType := range s.supportedResponseTypes {
@@ -566,15 +570,17 @@ func (s *Server) sendCodeResponse(w http.ResponseWriter, r *http.Request, authRe
 		switch responseType {
 		case responseTypeCode:
 			code = storage.AuthCode{
-				ID:            storage.NewID(),
-				ClientID:      authReq.ClientID,
-				ConnectorID:   authReq.ConnectorID,
-				Nonce:         authReq.Nonce,
-				Scopes:        authReq.Scopes,
-				Claims:        authReq.Claims,
-				Expiry:        s.now().Add(time.Minute * 30),
-				RedirectURI:   authReq.RedirectURI,
-				ConnectorData: authReq.ConnectorData,
+				ID:                  storage.NewID(),
+				ClientID:            authReq.ClientID,
+				ConnectorID:         authReq.ConnectorID,
+				Nonce:               authReq.Nonce,
+				Scopes:              authReq.Scopes,
+				Claims:              authReq.Claims,
+				Expiry:              s.now().Add(time.Minute * 30),
+				RedirectURI:         authReq.RedirectURI,
+				ConnectorData:       authReq.ConnectorData,
+				CodeChallenge:       authReq.CodeChallenge,
+				CodeChallengeMethod: authReq.CodeChallengeMethod,
 			}
 			if err := s.storage.CreateAuthCode(code); err != nil {
 				s.logger.Errorf("Failed to create auth code: %v", err)
@@ -699,6 +705,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAuthCode(w http.ResponseWriter, r *http.Request, client storage.Client) {
 	code := r.PostFormValue("code")
 	redirectURI := r.PostFormValue("redirect_uri")
+	codeVerifier := r.PostFormValue("code_verifier")
 
 	authCode, err := s.storage.GetAuthCode(code)
 	if err != nil || s.now().After(authCode.Expiry) || authCode.ClientID != client.ID {
@@ -714,6 +721,28 @@ func (s *Server) handleAuthCode(w http.ResponseWriter, r *http.Request, client s
 	if authCode.RedirectURI != redirectURI {
 		s.tokenErrHelper(w, errInvalidRequest, "redirect_uri did not match URI from initial request.", http.StatusBadRequest)
 		return
+	}
+
+	// Backward compatibility for clients that do not implement PKCE https://tools.ietf.org/html/rfc7636#section-5
+	if authCode.CodeChallenge != "" {
+		if codeVerifier == "" {
+			s.tokenErrHelper(w, errInvalidRequest, "Failed to get code_verifier.", http.StatusBadRequest)
+			return
+		}
+		// Verify code_verifier https://tools.ietf.org/html/rfc7636#section-4.6
+		var codeChallenge string
+		switch authCode.CodeChallengeMethod {
+		case codeChallengeMethodS256:
+			sum := sha256.Sum256([]byte(codeVerifier))
+			codeChallenge = base64.RawURLEncoding.EncodeToString(sum[:])
+		default:
+			codeChallenge = codeVerifier
+		}
+
+		if codeChallenge != authCode.CodeChallenge {
+			s.tokenErrHelper(w, errInvalidGrant, "code_challenge did not match from initial request.", http.StatusBadRequest)
+			return
+		}
 	}
 
 	accessToken := storage.NewID()

@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	jose "gopkg.in/square/go-jose.v2"
+	"gopkg.in/square/go-jose.v2"
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/server/internal"
@@ -124,6 +124,11 @@ const (
 	responseTypeCode    = "code"     // "Regular" flow
 	responseTypeToken   = "token"    // Implicit flow for frontend apps.
 	responseTypeIDToken = "id_token" // ID Token in url fragment
+)
+
+const (
+	codeChallengeMethodPlain = "plain"
+	codeChallengeMethodS256  = "S256"
 )
 
 func parseScopes(scopes []string) connector.Scopes {
@@ -388,6 +393,7 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (req storage.AuthReq
 	// Some clients, like the old go-oidc, provide extra whitespace. Tolerate this.
 	scopes := strings.Fields(q.Get("scope"))
 	responseTypes := strings.Fields(q.Get("response_type"))
+	codeChallengeMethodType := q.Get("code_challenge_method")
 
 	client, err := s.storage.GetClient(clientID)
 	if err != nil {
@@ -494,6 +500,12 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (req storage.AuthReq
 		}
 	}
 
+	if codeChallengeMethodType != codeChallengeMethodS256 {
+		if codeChallengeMethodType != codeChallengeMethodPlain && codeChallengeMethodType != "" {
+			return req, newErr("invalid_request", "Unsupported code challenge method %q", codeChallengeMethodType)
+		}
+	}
+
 	return storage.AuthRequest{
 		ID:                  storage.NewID(),
 		ClientID:            client.ID,
@@ -503,6 +515,8 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (req storage.AuthReq
 		Scopes:              scopes,
 		RedirectURI:         redirectURI,
 		ResponseTypes:       responseTypes,
+		CodeChallenge:       q.Get("code_challenge"),
+		CodeChallengeMethod: q.Get("code_challenge_method"),
 	}, nil
 }
 
